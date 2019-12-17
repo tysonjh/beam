@@ -45,8 +45,8 @@ public class ApplianceShuffleEntryReader implements ShuffleEntryReader {
 
     if (cache) {
       // Limit the size of the cache.
-      final int maxBatches = 32;
-      batchReader = new CachingShuffleBatchReader(batchReader, maxBatches);
+      final long maxBytes = 32L * 1024;
+      batchReader = new CachingShuffleBatchReader(batchReader, maxBytes);
     }
     entryReader = new BatchingShuffleEntryReader(batchReader);
   }
