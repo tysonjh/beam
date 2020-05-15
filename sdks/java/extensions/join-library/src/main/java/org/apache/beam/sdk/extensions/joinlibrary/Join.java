@@ -19,16 +19,23 @@ package org.apache.beam.sdk.extensions.joinlibrary;
 
 import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
 
+import com.google.common.annotations.VisibleForTesting;
+import javax.annotation.Nullable;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.ProcessFunction;
 import org.apache.beam.sdk.transforms.join.CoGbkResult;
 import org.apache.beam.sdk.transforms.join.CoGroupByKey;
 import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.TupleTag;
+import org.joda.time.Duration;
+import org.joda.time.Instant;
 
 /**
  * Utility class with different versions of joins. All methods join two collections of key/value
@@ -313,6 +320,135 @@ public class Join {
                       ((KvCoder) leftCollection.getCoder()).getValueCoder(),
                       ((KvCoder) rightCollection.getCoder()).getValueCoder())));
     }
+  }
+
+  // TODO(tysonjh): refactor to a single BiTemporalJoin class by introducing a new serializable
+  // function to facilitate different join algorithms (inner, outer, left, etc.). A similar refactor
+  // could apply to the other joins in this implementation.
+  public static class BiTemporalInnerJoin<K, V1, V2>
+      extends PTransform<PCollection<KV<K, V1>>, PCollection<KV<K, KV<V1, V2>>>> {
+
+    private PCollection<KV<K, V2>> rightCollection;
+    // TODO(tysonjh): Not sure what the standard term for this would be in Beam. Perhaps find a
+    // better name for these? Maybe something to do with the word 'late', 'lateness', or
+    // 'tolerance'?
+    private Duration leftElementDelay;
+    private Duration rightElementDelay;
+    private ProcessFunction<KV<Instant, Instant>, Boolean> temporalPredicate;
+    private ProcessFunction<KV<V1, V2>, Boolean> predicate;
+
+    // TODO(tysonjh): would a fluent pattern be preferable given the number of parameters?
+    private BiTemporalInnerJoin(
+        Duration leftElementDelay,
+        PCollection<KV<K, V2>> rightCollection,
+        Duration rightElementDelay,
+        @Nullable ProcessFunction<KV<Instant, Instant>, Boolean> temporalPredicate,
+        @Nullable ProcessFunction<KV<V1, V2>, Boolean> predicate) {
+      this.leftElementDelay = leftElementDelay;
+      this.rightCollection = rightCollection;
+      this.rightElementDelay = rightElementDelay;
+      this.temporalPredicate = temporalPredicate;
+      this.predicate = predicate;
+    }
+
+    // TODO(tysonjh): Does a user need access to this like the other classes? It would be nice
+    // to get rid of this and just use the constructor if not.
+    static <K, V1, V2> PTransform<PCollection<KV<K, V1>>, PCollection<KV<K, KV<V1, V2>>>> with(
+        final Duration leftElementDelay,
+        final PCollection<KV<K, V2>> rightCollection,
+        final Duration rightElementDelay,
+        @Nullable final ProcessFunction<KV<Instant, Instant>, Boolean> temporalPredicate,
+        @Nullable final ProcessFunction<KV<V1, V2>, Boolean> predicate) {
+      return new BiTemporalInnerJoin<>(
+          leftElementDelay, rightCollection, rightElementDelay, temporalPredicate, predicate);
+    }
+
+    @Override
+    public PCollection<KV<K, KV<V1, V2>>> expand(PCollection<KV<K, V1>> leftCollection) {
+      // Stateful DoFn takes exactly one input PCollection so the two join inputs must be flattened.
+      // To achieve this, they are normalized as KV<K, Pair<V1, V2>> such that, WLOG, for all
+      // elements from the left input the normalized PCollection will have KV<K, Pair<V1, null>>.
+      // TODO(tysonjh): should a POJO for Pair be used to differentiate between a null generated as
+      // part of this normalization step and one from the input PCollection?
+      PCollection<KV<K, KV<V1, V2>>> leftNormalized =
+          leftCollection.apply(
+              "NormalizeLeft",
+              ParDo.of(
+                  new DoFn<KV<K, V1>, KV<K, KV<V1, V2>>>() {
+                    @ProcessElement
+                    public void processElement(ProcessContext c) {
+                      KV<K, V1> left = c.element();
+                      c.output(KV.of(left.getKey(), KV.of(left.getValue(), null)));
+                    }
+                  }));
+
+      PCollection<KV<K, KV<V1, V2>>> rightNormalized =
+          rightCollection.apply(
+              "NormalizeRight",
+              ParDo.of(
+                  new DoFn<KV<K, V2>, KV<K, KV<V1, V2>>>() {
+                    @ProcessElement
+                    public void processElement(ProcessContext c) {
+                      KV<K, V2> right = c.element();
+                      c.output(KV.of(right.getKey(), KV.of(null, right.getValue())));
+                    }
+                  }));
+
+      PCollection<KV<K, KV<V1, V2>>> flattened =
+          PCollectionList.of(leftNormalized)
+              .and(rightNormalized)
+              .apply("FlattenNormalized", Flatten.pCollections());
+      return flattened.apply(
+          ParDo.of(
+              new BiTemporalInnerJoinDoFn<K, V1, V2>(
+                  leftElementDelay, rightElementDelay, temporalPredicate, predicate)));
+    }
+
+    @VisibleForTesting
+    static class BiTemporalInnerJoinDoFn<K, V1, V2>
+        extends DoFn<KV<K, KV<V1, V2>>, KV<K, KV<V1, V2>>> {
+      private Duration leftElementDelay;
+      private Duration rightElementDelay;
+      private ProcessFunction<KV<Instant, Instant>, Boolean> temporalPredicate;
+      private ProcessFunction<KV<V1, V2>, Boolean> predicate;
+
+      BiTemporalInnerJoinDoFn(
+          final Duration leftElementDelay,
+          final Duration rightElementDelay,
+          @Nullable final ProcessFunction<KV<Instant, Instant>, Boolean> temporalPredicate,
+          @Nullable final ProcessFunction<KV<V1, V2>, Boolean> predicate) {}
+    }
+  }
+
+  /**
+   * Joins two possibly unbounded input PCollections<KV<K,V>> on K in the global window. A
+   * processing-time element expiration must be specified for each input PCollection to limit the
+   * in-memory buffer size. An optional ProcessFunction may be specified as a temporal constraint
+   * join predicate.
+   *
+   * @param leftCollection the left input to the join
+   * @param leftElementDelay processing-time duration an element from leftCollection remains valid
+   * @param rightCollection the right input to the join
+   * @param rightElementDelay processing-time duration an element from rightCollection remains valid
+   * @param temporalPredicate optional temporal predicate used to filter matching input elements
+   * @param predicate optional join predicate
+   * @param <K> the join key
+   * @param <V1> left value
+   * @param <V2> right value
+   * @return a BiTemporalInnerJoin PTransform
+   */
+  // TODO(tysonjh): specializations for nullable variants to simplify UX.
+  public static <K, V1, V2> PCollection<KV<K, KV<V1, V2>>> biTemporalInnerJoin(
+      final PCollection<KV<K, V1>> leftCollection,
+      final Duration leftElementDelay,
+      final PCollection<KV<K, V2>> rightCollection,
+      final Duration rightElementDelay,
+      @Nullable final ProcessFunction<KV<Instant, Instant>, Boolean> temporalPredicate,
+      @Nullable final ProcessFunction<KV<V1, V2>, Boolean> predicate) {
+    return leftCollection.apply(
+        "BiTemporalInnerJoin",
+        BiTemporalInnerJoin.with(
+            leftElementDelay, rightCollection, rightElementDelay, temporalPredicate, predicate));
   }
 
   /**
