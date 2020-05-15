@@ -19,8 +19,11 @@ package org.apache.beam.sdk.extensions.joinlibrary;
 
 import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
 
+import com.google.auto.value.AutoValue;
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.join.CoGbkResult;
@@ -28,6 +31,7 @@ import org.apache.beam.sdk.transforms.join.CoGroupByKey;
 import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.TupleTag;
 
 /**
@@ -313,6 +317,55 @@ public class Join {
                       ((KvCoder) leftCollection.getCoder()).getValueCoder(),
                       ((KvCoder) rightCollection.getCoder()).getValueCoder())));
     }
+  }
+
+  public static class BiTemporalInnerJoin<K, V1, V2> extends PTransform<PCollection<KV<K, V1>>, PCollection<KV<K, KV<V1, V2>>>> {
+
+    private PCollection<KV<K, V2>> rightCollection;
+
+    private BiTemporalInnerJoin(PCollection<KV<K, V2>> rightCollection) {
+      this.rightCollection = rightCollection;
+    }
+
+    // Does a user need access to this like the other classes?
+    static <K, V1, V2> PTransform<PCollection<KV<K, V1>>, PCollection<KV<K, KV<V1, V2>>>> with(final PCollection<KV<K, V2>> rightCollection) {
+      return new BiTemporalInnerJoin<>(rightCollection);
+    }
+
+    @Override
+    public PCollection<KV<K, KV<V1, V2>>> expand(PCollection<KV<K, V1>> leftCollection) {
+      // normalize values KV<K, V1>, K<K, V2> -> KV<K, Pair<V1, V2>>
+
+      PCollection<KV<K, KV<V1, V2>>> leftNormalized = leftCollection.apply("NormalizeLeft", ParDo.of(new DoFn<KV<K, V1>, KV<K, KV<V1, V2>>>() {
+        @ProcessElement
+        public void processElement(ProcessContext c) {
+          KV<K, V1> left = c.element();
+          c.output(KV.of(left.getKey(), KV.of(left.getValue(), null)));
+        }
+      }));
+
+      PCollection<KV<K, KV<V1, V2>>> rightNormalized = rightCollection.apply("NormalizeRight", ParDo.of(new DoFn<KV<K, V2>, KV<K, KV<V1, V2>>>() {
+        @ProcessElement
+        public void processElement(ProcessContext c) {
+          KV<K, V2> right = c.element();
+          c.output(KV.of(right.getKey(), KV.of(null, right.getValue())));
+        }
+      }));
+
+      PCollectionList<KV<K, KV<V1, V2>> list = PCollectionList.of(leftNormalized).and(rightNormalized);
+      PCollection<KV<K, KV<V1, V2>>> flattened = list.apply("FlattenNormalized", Flatten.pCollections());
+      return flattened.apply(ParDo.of(new BiTemporalInnerJoinDoFn<K, V1, V2>()));
+    }
+
+    @VisibleForTesting
+    static class BiTemporalInnerJoinDoFn<K, V1, V2> extends DoFn<KV<K, KV<V1, V2>>, KV<K, KV<V1, V2>>> {
+      BiTemporalInnerJoinDoFn() { }
+    }
+  }
+
+  public static <K, V1, V2> PCollection<KV<K, KV<V1, V2>>> biTemporalInnerJoin(
+      final PCollection<KV<K, V1>> leftCollection, final PCollection<KV<K, V2>> rightCollection) {
+    return leftCollection.apply("BiTemporalInnerJoin", BiTemporalInnerJoin.with(rightCollection));
   }
 
   /**
