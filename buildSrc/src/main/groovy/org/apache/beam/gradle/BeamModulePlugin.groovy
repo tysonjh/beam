@@ -399,7 +399,9 @@ class BeamModulePlugin implements Plugin<Project> {
     def hadoop_version = "2.8.5"
     def hamcrest_version = "2.1"
     def jackson_version = "2.10.2"
-    def jaxb_api_version = "2.2.12"
+    def jaxb_api_version = "2.3.1"
+    def jaxb_impl_version = "2.3.1"
+    def jaxb_core_version = "2.3.0.1"
     def kafka_version = "1.0.0"
     def nemo_version = "0.1"
     def netty_version = "4.1.30.Final"
@@ -519,6 +521,8 @@ class BeamModulePlugin implements Plugin<Project> {
         jackson_datatype_joda                       : "com.fasterxml.jackson.datatype:jackson-datatype-joda:$jackson_version",
         jackson_module_scala                        : "com.fasterxml.jackson.module:jackson-module-scala_2.11:$jackson_version",
         jaxb_api                                    : "javax.xml.bind:jaxb-api:$jaxb_api_version",
+        jaxb_core                                   : "com.sun.xml.bind:jaxb-core:$jaxb_core_version",
+        jaxb_impl                                   : "com.sun.xml.bind:jaxb-impl:$jaxb_impl_version",
         joda_time                                   : "joda-time:joda-time:2.10.5",
         jsonassert                                  : "org.skyscreamer:jsonassert:1.5.0",
         jsr305                                      : "com.google.code.findbugs:jsr305:3.0.2",
@@ -547,10 +551,10 @@ class BeamModulePlugin implements Plugin<Project> {
         slf4j_jdk14                                 : "org.slf4j:slf4j-jdk14:1.7.25",
         slf4j_log4j12                               : "org.slf4j:slf4j-log4j12:1.7.25",
         snappy_java                                 : "org.xerial.snappy:snappy-java:1.1.4",
-        spark_core                                  : "org.apache.spark:spark-core_2.11:$spark_version",
-        spark_network_common                        : "org.apache.spark:spark-network-common_2.11:$spark_version",
-        spark_sql                                   : "org.apache.spark:spark-sql_2.11:$spark_version",
-        spark_streaming                             : "org.apache.spark:spark-streaming_2.11:$spark_version",
+        spark_core                                  : "org.apache.spark:spark-core_2.12:$spark_version",
+        spark_network_common                        : "org.apache.spark:spark-network-common_2.12:$spark_version",
+        spark_sql                                   : "org.apache.spark:spark-sql_2.12:$spark_version",
+        spark_streaming                             : "org.apache.spark:spark-streaming_2.12:$spark_version",
         stax2_api                                   : "org.codehaus.woodstox:stax2-api:3.1.4",
         vendored_bytebuddy_1_10_8                   : "org.apache.beam:beam-vendor-bytebuddy-1_10_8:0.1",
         vendored_grpc_1_26_0                        : "org.apache.beam:beam-vendor-grpc-1_26_0:0.3",
