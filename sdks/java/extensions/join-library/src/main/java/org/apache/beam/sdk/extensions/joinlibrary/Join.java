@@ -19,16 +19,31 @@ package org.apache.beam.sdk.extensions.joinlibrary;
 
 import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
 
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.coders.InstantCoder;
 import org.apache.beam.sdk.coders.KvCoder;
+import org.apache.beam.sdk.coders.ListCoder;
+import org.apache.beam.sdk.coders.NullableCoder;
+import org.apache.beam.sdk.state.StateSpec;
+import org.apache.beam.sdk.state.StateSpecs;
+import org.apache.beam.sdk.state.ValueState;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.Flatten;
+import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.SimpleFunction;
 import org.apache.beam.sdk.transforms.join.CoGbkResult;
 import org.apache.beam.sdk.transforms.join.CoGroupByKey;
 import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.TupleTag;
+import org.joda.time.Duration;
+import org.joda.time.Instant;
 
 /**
  * Utility class with different versions of joins. All methods join two collections of key/value
@@ -90,10 +105,10 @@ public class Join {
                   }))
           .setCoder(
               KvCoder.of(
-                  ((KvCoder) leftCollection.getCoder()).getKeyCoder(),
+                  ((KvCoder<K, V1>) leftCollection.getCoder()).getKeyCoder(),
                   KvCoder.of(
-                      ((KvCoder) leftCollection.getCoder()).getValueCoder(),
-                      ((KvCoder) rightCollection.getCoder()).getValueCoder())));
+                      ((KvCoder<K, V1>) leftCollection.getCoder()).getValueCoder(),
+                      ((KvCoder<K, V2>) rightCollection.getCoder()).getValueCoder())));
     }
   }
 
@@ -158,10 +173,10 @@ public class Join {
                   }))
           .setCoder(
               KvCoder.of(
-                  ((KvCoder) leftCollection.getCoder()).getKeyCoder(),
+                  ((KvCoder<K, V1>) leftCollection.getCoder()).getKeyCoder(),
                   KvCoder.of(
-                      ((KvCoder) leftCollection.getCoder()).getValueCoder(),
-                      ((KvCoder) rightCollection.getCoder()).getValueCoder())));
+                      ((KvCoder<K, V1>) leftCollection.getCoder()).getValueCoder(),
+                      ((KvCoder<K, V2>) rightCollection.getCoder()).getValueCoder())));
     }
   }
 
@@ -227,10 +242,10 @@ public class Join {
                   }))
           .setCoder(
               KvCoder.of(
-                  ((KvCoder) leftCollection.getCoder()).getKeyCoder(),
+                  ((KvCoder<K, V1>) leftCollection.getCoder()).getKeyCoder(),
                   KvCoder.of(
-                      ((KvCoder) leftCollection.getCoder()).getValueCoder(),
-                      ((KvCoder) rightCollection.getCoder()).getValueCoder())));
+                      ((KvCoder<K, V1>) leftCollection.getCoder()).getValueCoder(),
+                      ((KvCoder<K, V2>) rightCollection.getCoder()).getValueCoder())));
     }
   }
 
@@ -308,10 +323,10 @@ public class Join {
                   }))
           .setCoder(
               KvCoder.of(
-                  ((KvCoder) leftCollection.getCoder()).getKeyCoder(),
+                  ((KvCoder<K, V1>) leftCollection.getCoder()).getKeyCoder(),
                   KvCoder.of(
-                      ((KvCoder) leftCollection.getCoder()).getValueCoder(),
-                      ((KvCoder) rightCollection.getCoder()).getValueCoder())));
+                      ((KvCoder<K, V1>) leftCollection.getCoder()).getValueCoder(),
+                      ((KvCoder<K, V2>) rightCollection.getCoder()).getValueCoder())));
     }
   }
 
@@ -348,6 +363,209 @@ public class Join {
       final PCollection<KV<K, V1>> leftCollection,
       final PCollection<KV<K, V2>> rightCollection) {
     return leftCollection.apply(name, InnerJoin.with(rightCollection));
+  }
+
+  public static class TemporalInnerJoin<K, V1, V2>
+      extends PTransform<PCollection<KV<K, V1>>, PCollection<KV<K, KV<V1, V2>>>> {
+    private final transient PCollection<KV<K, V2>> rightCollection;
+    private final Duration temporalBound;
+    private final SimpleFunction<KV<V1, V2>, Boolean> comparatorFn;
+
+    private TemporalInnerJoin(
+        final PCollection<KV<K, V2>> rightCollection,
+        final Duration temporalBound,
+        final SimpleFunction<KV<V1, V2>, Boolean> compareFn) {
+      this.temporalBound = temporalBound;
+      this.rightCollection = rightCollection;
+      this.comparatorFn = compareFn;
+    }
+
+    public static <K, V1, V2> TemporalInnerJoin<K, V1, V2> with(
+        PCollection<KV<K, V2>> rightCollection,
+        Duration temporalBound, // Note: non-inclusive!!
+        SimpleFunction<KV<V1, V2>, Boolean> compareFn) {
+      return new TemporalInnerJoin<>(rightCollection, temporalBound, compareFn);
+    }
+
+    @Override
+    public PCollection<KV<K, KV<V1, V2>>> expand(PCollection<KV<K, V1>> leftCollection) {
+      // left        right
+      // tag-left    tag-right (create union type)
+      //   \         /
+      //     flatten
+      //     join
+
+      Coder<K> keyCoder = ((KvCoder<K, V1>) leftCollection.getCoder()).getKeyCoder();
+      Coder<V1> leftValueCoder = ((KvCoder<K, V1>) leftCollection.getCoder()).getValueCoder();
+      Coder<V2> rightValueCoder = ((KvCoder<K, V2>) rightCollection.getCoder()).getValueCoder();
+
+      PCollection<KV<K, KV<V1, V2>>> leftUnion =
+          leftCollection
+              .apply("LeftUnionTag", MapElements.via(new LeftUnionTagFn<K, V1, V2>()))
+              .setCoder(
+                  KvCoder.of(
+                      keyCoder,
+                      KvCoder.of(
+                          NullableCoder.of(leftValueCoder), NullableCoder.of(rightValueCoder))));
+
+      PCollection<KV<K, KV<V1, V2>>> rightUnion =
+          rightCollection
+              .apply("RightUnionTag", MapElements.via(new RightUnionTagFn<K, V1, V2>()))
+              .setCoder(
+                  KvCoder.of(
+                      keyCoder,
+                      KvCoder.of(
+                          NullableCoder.of(leftValueCoder), NullableCoder.of(rightValueCoder))));
+
+      return PCollectionList.of(leftUnion)
+          .and(rightUnion)
+          .apply(Flatten.pCollections())
+          .apply(
+              "JoinFn",
+              ParDo.of(
+                  new TemporalInnerJoinFn<>(
+                      leftValueCoder, rightValueCoder, temporalBound, comparatorFn)));
+    }
+  }
+
+  private static class LeftUnionTagFn<K, V1, V2>
+      extends SimpleFunction<KV<K, V1>, KV<K, KV<V1, V2>>> {
+    @Override
+    public KV<K, KV<V1, V2>> apply(KV<K, V1> element) {
+      return KV.of(element.getKey(), KV.of(element.getValue(), null));
+    }
+  }
+
+  private static class RightUnionTagFn<K, V1, V2>
+      extends SimpleFunction<KV<K, V2>, KV<K, KV<V1, V2>>> {
+    @Override
+    public KV<K, KV<V1, V2>> apply(KV<K, V2> element) {
+      return KV.of(element.getKey(), KV.of(null, element.getValue()));
+    }
+  }
+
+  private static class TemporalInnerJoinFn<K, V1, V2>
+      extends DoFn<KV<K, KV<V1, V2>>, KV<K, KV<V1, V2>>> {
+    @StateId("left")
+    private final StateSpec<ValueState<List<KV<Instant, V1>>>> left;
+
+    @StateId("right")
+    private final StateSpec<ValueState<List<KV<Instant, V2>>>> right;
+
+    // @TimerId("temporalBound")
+    // private final TimerSpec temporalBoundSpec = TimerSpecs.timer(TimeDomain.EVENT_TIME);
+
+    private final Duration temporalBound;
+    private final SimpleFunction<KV<V1, V2>, Boolean> compareFn;
+
+    protected TemporalInnerJoinFn(
+        final Coder<V1> leftCoder,
+        final Coder<V2> rightCoder,
+        final Duration temporalBound,
+        SimpleFunction<KV<V1, V2>, Boolean> compareFn) {
+      this.left = StateSpecs.value(ListCoder.of(KvCoder.of(InstantCoder.of(), leftCoder)));
+      this.right = StateSpecs.value(ListCoder.of(KvCoder.of(InstantCoder.of(), rightCoder)));
+      this.temporalBound = temporalBound;
+      this.compareFn = compareFn;
+    }
+
+    @ProcessElement
+    public void processElement(
+        ProcessContext c,
+        @StateId("left") ValueState<List<KV<Instant, V1>>> leftState,
+        @StateId("right") ValueState<List<KV<Instant, V2>>> rightState,
+        @Timestamp Instant timestamp) {
+      // TODO maybe this could be in a Setup?
+      List<KV<Instant, V1>> leftStateList = leftState.read();
+      if (leftStateList == null) {
+        leftStateList = new ArrayList<>();
+      }
+      List<KV<Instant, V2>> rightStateList = rightState.read();
+      if (rightStateList == null) {
+        rightStateList = new ArrayList<>();
+      }
+
+      KV<K, KV<V1, V2>> e = c.element();
+      K key = e.getKey();
+      V1 left = e.getValue().getKey();
+      V2 right = e.getValue().getValue();
+      if (left != null) {
+        // This is a left element. If the right list is empty, no point in searching for a match.
+        if (rightStateList.isEmpty()) {
+          leftStateList.add(KV.of(timestamp, left));
+          leftState.write(leftStateList);
+          return;
+        }
+
+        // Search the right collection for a match.
+        int i = 0;
+        boolean found = false;
+        for (KV<Instant, V2> kv : rightStateList) {
+          if (new Duration(kv.getKey(), timestamp).abs().isShorterThan(temporalBound)
+              && compareFn.apply(KV.of(left, kv.getValue()))) {
+            found = true;
+            c.output(KV.of(key, KV.of(left, kv.getValue())));
+            break;
+          }
+          ++i;
+        }
+        if (found) {
+          rightStateList.remove(i);
+          rightState.write(rightStateList);
+        }
+      } else {
+        checkNotNull(right);
+
+        if (leftStateList.isEmpty()) {
+          rightStateList.add(KV.of(timestamp, right));
+          rightState.write(rightStateList);
+          return;
+        }
+
+        int i = 0;
+        boolean found = false;
+        for (KV<Instant, V1> kv : leftStateList) {
+          if (new Duration(kv.getKey(), timestamp).abs().isShorterThan(temporalBound)
+              && compareFn.apply(KV.of(kv.getValue(), right))) {
+            found = true;
+            c.output(KV.of(key, KV.of(kv.getValue(), right)));
+            break;
+          }
+          ++i;
+        }
+        if (found) {
+          leftStateList.remove(i);
+          leftState.write(leftStateList);
+        }
+      }
+    }
+  }
+
+  /**
+   * Temporal inner join of two collections of KV elements.
+   *
+   * <p>A temporal join evicts elements from the left/right cache based on the provided EventTime
+   * {link} eviction tolerances.
+   *
+   * <p>TODO: tysonjh - do we need a duration for cleaning up the whole cache? Or is this derived
+   * from an event-time-trigger update of the watermark?
+   */
+  public static <K, V1, V2> PCollection<KV<K, KV<V1, V2>>> temporalInnerJoin(
+      final String name,
+      final PCollection<KV<K, V1>> leftCollection,
+      final PCollection<KV<K, V2>> rightCollection,
+      final Duration
+          temporalBound, // other names - tolerance - skew - lateness - limit - bound (note this is
+      // INCLUSIVE)
+      final SimpleFunction<KV<V1, V2>, Boolean> compareFn) {
+    return leftCollection
+        .apply(name, TemporalInnerJoin.with(rightCollection, temporalBound, compareFn))
+        .setCoder(
+            KvCoder.of(
+                ((KvCoder<K, V1>) leftCollection.getCoder()).getKeyCoder(),
+                KvCoder.of(
+                    ((KvCoder<K, V1>) leftCollection.getCoder()).getValueCoder(),
+                    ((KvCoder<K, V2>) rightCollection.getCoder()).getValueCoder())));
   }
 
   /**
