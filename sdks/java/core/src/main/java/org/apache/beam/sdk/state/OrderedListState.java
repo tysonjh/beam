@@ -47,6 +47,8 @@ public interface OrderedListState<T>
    */
   void clearRange(Instant minTimestamp, Instant limitTimestamp);
 
+  void remove(TimestampedValue<T> element);
+
   /**
    * Call to indicate that a specific range will be read from the list, allowing runners to batch
    * multiple range reads.

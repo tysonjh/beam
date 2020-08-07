@@ -517,6 +517,12 @@ class WindmillStateInternals<K> implements StateInternals {
     }
 
     @Override
+    public void remove(TimestampedValue<T> element) {
+      throw new UnsupportedOperationException(
+          String.format("%s is not supported", OrderedListState.class.getSimpleName()));
+    }
+
+    @Override
     public void add(TimestampedValue<T> value) {
       throw new UnsupportedOperationException(
           String.format("%s is not supported", OrderedListState.class.getSimpleName()));

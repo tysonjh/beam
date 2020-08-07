@@ -24,9 +24,14 @@ import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.coders.VarLongCoder;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
+import org.apache.beam.sdk.testing.TestStream;
 import org.apache.beam.sdk.transforms.Create;
+import org.apache.beam.sdk.transforms.SimpleFunction;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.TimestampedValue;
+import org.joda.time.Duration;
+import org.joda.time.Instant;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -166,4 +171,165 @@ public class InnerJoinTest {
             Create.of(leftListOfKv).withCoder(KvCoder.of(StringUtf8Coder.of(), VarLongCoder.of()))),
         null);
   }
+
+  // Temporal Join Tests
+  private static class FirstCharacterEqualsFn extends SimpleFunction<KV<String, String>, Boolean> {
+    @Override
+    public Boolean apply(KV<String, String> input) {
+      return input.getKey().charAt(0) == input.getValue().charAt(0);
+    }
+  }
+
+  private static class TemporalTestRecord {
+    private final String key;
+    private final String value;
+    private final Instant timestamp;
+
+    private TemporalTestRecord(String key, String value, Instant timestamp) {
+      this.key = key;
+      this.value = value;
+      this.timestamp = timestamp;
+    }
+
+    public static TemporalTestRecord of(String key, String value, Instant timestamp) {
+      return new TemporalTestRecord(key, value, timestamp);
+    }
+
+    public KV<String, String> asKV() {
+      return KV.of(key, String.format("%s-%s", value, timestamp));
+    }
+
+    public TimestampedValue<KV<String, String>> asTimestampedKV() {
+      return TimestampedValue.of(asKV(), timestamp);
+    }
+
+    public String getKey() {
+      return key;
+    }
+
+    public String getValue() {
+      return value;
+    }
+
+    public Instant getTimestamp() {
+      return timestamp;
+    }
+  }
+
+  TimestampedValue<KV<String, String>> timestampedTemporalTestRecord(
+      String key, TemporalTestRecord record) {
+    return TimestampedValue.of(KV.of(key, record.toString()), record.getTimestamp());
+  }
+
+  @Test
+  public void testTemporalJoinWithOneTimestampedValueStreaming() {
+    Duration temporalBound = Duration.standardSeconds(1);
+
+    TestStream<KV<String, String>> leftStream =
+        TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+            .advanceWatermarkTo(new Instant(0L))
+            .addElements(TemporalTestRecord.of("key", "value", new Instant(0)).asTimestampedKV())
+            .advanceWatermarkToInfinity();
+    PCollection<KV<String, String>> leftCollection = p.apply("LeftStream", leftStream);
+
+    // No elements.
+    TestStream<KV<String, String>> rightStream =
+        TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+            .advanceWatermarkTo(new Instant(0L))
+            .advanceWatermarkToInfinity();
+
+    PCollection<KV<String, String>> rightCollection = p.apply("RightStream", rightStream);
+
+    PCollection<KV<String, KV<String, String>>> output =
+        Join.temporalInnerJoin(
+            "Join", leftCollection, rightCollection, temporalBound, new FirstCharacterEqualsFn());
+    PAssert.that(output).empty();
+    p.run();
+  }
+
+  @Test
+  public void testTemporalJoinWithOneJoinMatchStreaming() {
+    Duration temporalBound = Duration.standardSeconds(1);
+
+    TestStream<KV<String, String>> leftStream =
+        TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+            .advanceWatermarkTo(new Instant(0L))
+            .addElements(TemporalTestRecord.of("key", "v-left", new Instant(0L)).asTimestampedKV())
+            .advanceWatermarkToInfinity();
+    PCollection<KV<String, String>> leftCollection = p.apply("LeftStream", leftStream);
+
+    TestStream<KV<String, String>> rightStream =
+        TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+            .advanceWatermarkTo(new Instant(0L))
+            .addElements(TemporalTestRecord.of("key", "v-right", new Instant(0L)).asTimestampedKV())
+            .advanceWatermarkToInfinity();
+
+    PCollection<KV<String, String>> rightCollection = p.apply("RightStream", rightStream);
+
+    List<KV<String, KV<String, String>>> expected = new ArrayList<>();
+    expected.add(
+        KV.of(
+            "key",
+            KV.of(
+                TemporalTestRecord.of("key", "v-left", new Instant(0L)).asKV().getValue(),
+                TemporalTestRecord.of("key", "v-right", new Instant(0L)).asKV().getValue())));
+
+    PCollection<KV<String, KV<String, String>>> output =
+        Join.temporalInnerJoin(
+            "Join", leftCollection, rightCollection, temporalBound, new FirstCharacterEqualsFn());
+    PAssert.that(output).containsInAnyOrder(expected);
+    p.run();
+  }
+
+  @Test
+  public void testTemporalJoinTemporalBoundRespectedStreaming() {
+    Duration temporalBound = Duration.standardSeconds(2);
+
+    TestStream<KV<String, String>> leftStream =
+        TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+            .advanceWatermarkTo(new Instant(0L))
+            .addElements(
+                TemporalTestRecord.of("key", "v-left", new Instant(0L)).asTimestampedKV(),
+                TemporalTestRecord.of(
+                        "key", "v-left", new Instant(0L).plus(Duration.standardSeconds(3)))
+                    .asTimestampedKV())
+            .advanceWatermarkToInfinity();
+    PCollection<KV<String, String>> leftCollection = p.apply("LeftStream", leftStream);
+
+    TestStream<KV<String, String>> rightStream =
+        TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+            .advanceWatermarkTo(new Instant(0L))
+            .addElements(
+                TemporalTestRecord.of(
+                        "key", "v-right", new Instant(0L).plus(Duration.standardSeconds(4)))
+                    .asTimestampedKV())
+            .advanceWatermarkToInfinity();
+
+    PCollection<KV<String, String>> rightCollection = p.apply("RightStream", rightStream);
+
+    List<KV<String, KV<String, String>>> expected = new ArrayList<>();
+    expected.add(
+        KV.of(
+            "key",
+            KV.of(
+                TemporalTestRecord.of(
+                        "key", "v-left", new Instant(0L).plus(Duration.standardSeconds(3)))
+                    .asKV()
+                    .getValue(),
+                TemporalTestRecord.of(
+                        "key", "v-right", new Instant(0L).plus(Duration.standardSeconds(4)))
+                    .asKV()
+                    .getValue())));
+
+    PCollection<KV<String, KV<String, String>>> output =
+        Join.temporalInnerJoin(
+            "Join", leftCollection, rightCollection, temporalBound, new FirstCharacterEqualsFn());
+    PAssert.that(output).containsInAnyOrder(expected);
+    p.run();
+  }
+
+  // watermark advance marks old items for deletion
+  // clean up of resident elements after elements drop out of temporal bound (e.g. watermark
+  // advances)
+  // test that loops through from [0, N] for both left/right and joins
 }

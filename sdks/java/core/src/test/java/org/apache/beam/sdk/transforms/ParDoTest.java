@@ -2537,6 +2537,53 @@ public class ParDoTest implements Serializable {
     }
 
     @Test
+    @Category({ValidatesRunner.class, UsesStatefulParDo.class, UsesOrderedListState.class})
+    public void testOrderedListStateRemoveElement() {
+      final String stateId = "foo";
+      DoFn<KV<String, TimestampedValue<String>>, Iterable<TimestampedValue<String>>> fn =
+          new DoFn<KV<String, TimestampedValue<String>>, Iterable<TimestampedValue<String>>>() {
+
+            @StateId(stateId)
+            private final StateSpec<OrderedListState<String>> orderedListState =
+                StateSpecs.orderedList(StringUtf8Coder.of());
+
+            @ProcessElement
+            public void processElement(
+                @Element KV<String, TimestampedValue<String>> element,
+                @StateId(stateId) OrderedListState<String> state) {
+              state.add(element.getValue());
+            }
+
+            @OnWindowExpiration
+            public void onWindowExpiration(
+                @StateId(stateId) OrderedListState<String> state,
+                OutputReceiver<Iterable<TimestampedValue<String>>> o) {
+              state.remove(TimestampedValue.of("b", Instant.ofEpochMilli(42)));
+              o.output(state.read());
+            }
+          };
+
+      PCollection<Iterable<TimestampedValue<String>>> output =
+          pipeline
+              .apply(
+                  Create.of(
+                      KV.of("hello", TimestampedValue.of("a", Instant.ofEpochMilli(97))),
+                      KV.of("hello", TimestampedValue.of("b", Instant.ofEpochMilli(42))),
+                      KV.of("hello", TimestampedValue.of("b", Instant.ofEpochMilli(52))),
+                      KV.of("hello", TimestampedValue.of("c", Instant.ofEpochMilli(12)))))
+              .apply(ParDo.of(fn));
+
+      Iterable<TimestampedValue<String>> expected =
+          Lists.newArrayList(
+              TimestampedValue.of("c", Instant.ofEpochMilli(12)),
+              TimestampedValue.of("b", Instant.ofEpochMilli(52)),
+              TimestampedValue.of("a", Instant.ofEpochMilli(97)));
+
+      PAssert.that(output).containsInAnyOrder(expected);
+      pipeline.run();
+    }
+
+    @Test
     @Category({ValidatesRunner.class, UsesStatefulParDo.class})
     public void testCombiningState() {
       final String stateId = "foo";

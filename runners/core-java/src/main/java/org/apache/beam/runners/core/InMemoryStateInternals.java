@@ -483,6 +483,18 @@ public class InMemoryStateInternals<K> implements StateInternals {
     }
 
     @Override
+    public void remove(TimestampedValue<T> element) {
+      Collection<T> col = contents.get(element.getTimestamp());
+      if (col == null) {
+        return;
+      }
+      col.remove(element.getValue());
+      if (col.isEmpty()) {
+        contents.remove(element.getTimestamp());
+      }
+    }
+
+    @Override
     public InMemoryOrderedList<T> readLater() {
       return this;
     }
