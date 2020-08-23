@@ -328,8 +328,42 @@ public class InnerJoinTest {
     p.run();
   }
 
-  // eviction duration respected
+  @Test
+  public void testTemporalJoinTemporalWatermarkExpirationStreaming() {
+    Duration temporalBound = Duration.standardMinutes(5);
 
+    TestStream<KV<String, String>> leftStream =
+        TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+            .advanceWatermarkTo(new Instant(0L))
+            .addElements(
+                TemporalTestRecord.of(
+                        "key", "v-left", new Instant(0L).plus(Duration.standardMinutes(2)))
+                    .asTimestampedKV())
+            .advanceWatermarkTo(new Instant(0L).plus(Duration.standardMinutes(3)))
+            .addElements(
+                TemporalTestRecord.of(
+                        "key", "v-left", new Instant(0L).plus(Duration.standardMinutes(30)))
+                    .asTimestampedKV())
+            .advanceWatermarkToInfinity();
+    PCollection<KV<String, String>> leftCollection = p.apply("LeftStream", leftStream);
+
+    TestStream<KV<String, String>> rightStream =
+        TestStream.create(KvCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+            .advanceWatermarkTo(new Instant(0L))
+            .addElements(
+                TemporalTestRecord.of(
+                        "key", "v-right", new Instant(0L).plus(Duration.standardMinutes(4)))
+                    .asTimestampedKV())
+            .advanceWatermarkToInfinity();
+
+    PCollection<KV<String, String>> rightCollection = p.apply("RightStream", rightStream);
+
+    PCollection<KV<String, KV<String, String>>> output =
+        Join.temporalInnerJoin(
+            "Join", leftCollection, rightCollection, temporalBound, new FirstCharacterEqualsFn());
+    PAssert.that(output).empty();
+    p.run();
+  }
   // clean up of resident elements after elements drop out of temporal bound (e.g. watermark
   // advances)
   // test that loops through from [0, N] for both left/right and joins

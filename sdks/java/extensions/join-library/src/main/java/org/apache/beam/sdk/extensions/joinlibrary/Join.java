@@ -28,6 +28,10 @@ import org.apache.beam.sdk.coders.ListCoder;
 import org.apache.beam.sdk.coders.NullableCoder;
 import org.apache.beam.sdk.state.StateSpec;
 import org.apache.beam.sdk.state.StateSpecs;
+import org.apache.beam.sdk.state.TimeDomain;
+import org.apache.beam.sdk.state.Timer;
+import org.apache.beam.sdk.state.TimerSpec;
+import org.apache.beam.sdk.state.TimerSpecs;
 import org.apache.beam.sdk.state.ValueState;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
@@ -446,17 +450,33 @@ public class Join {
 
   private static class TemporalInnerJoinFn<K, V1, V2>
       extends DoFn<KV<K, KV<V1, V2>>, KV<K, KV<V1, V2>>> {
+    private enum TimerState {
+      UNINITIALIZED,
+      UNSET,
+      SET
+    }
+
     @StateId("left")
     private final StateSpec<ValueState<List<KV<Instant, V1>>>> left;
 
     @StateId("right")
     private final StateSpec<ValueState<List<KV<Instant, V2>>>> right;
 
-    // @TimerId("temporalBound")
-    // private final TimerSpec temporalBoundSpec = TimerSpecs.timer(TimeDomain.EVENT_TIME);
+    @TimerId("eviction")
+    private final TimerSpec evictionSpec = TimerSpecs.timer(TimeDomain.EVENT_TIME);
 
     private final Duration temporalBound;
     private final SimpleFunction<KV<V1, V2>, Boolean> compareFn;
+    private transient Duration evictionFrequency;
+    private transient TimerState evictionTimerState;
+    private transient Instant temporalBoundWatermark;
+
+    @Setup
+    public void setup() {
+      evictionFrequency = temporalBound.dividedBy(4);
+      evictionTimerState = TimerState.UNINITIALIZED;
+      temporalBoundWatermark = new Instant(0L);
+    }
 
     protected TemporalInnerJoinFn(
         final Coder<V1> leftCoder,
@@ -467,6 +487,9 @@ public class Join {
       this.right = StateSpecs.value(ListCoder.of(KvCoder.of(InstantCoder.of(), rightCoder)));
       this.temporalBound = temporalBound;
       this.compareFn = compareFn;
+      this.evictionFrequency = temporalBound.dividedBy(4);
+      this.evictionTimerState = TimerState.UNINITIALIZED;
+      this.temporalBoundWatermark = new Instant(0L);
     }
 
     @ProcessElement
@@ -474,8 +497,10 @@ public class Join {
         ProcessContext c,
         @StateId("left") ValueState<List<KV<Instant, V1>>> leftState,
         @StateId("right") ValueState<List<KV<Instant, V2>>> rightState,
-        @Timestamp Instant timestamp) {
-      // TODO maybe this could be in a Setup?
+        @Timestamp Instant timestamp,
+        @TimerId("eviction") Timer evictionTimer) {
+      setTimer(evictionTimer);
+
       List<KV<Instant, V1>> leftStateList = leftState.read();
       if (leftStateList == null) {
         leftStateList = new ArrayList<>();
@@ -490,54 +515,87 @@ public class Join {
       V1 left = e.getValue().getKey();
       V2 right = e.getValue().getValue();
       if (left != null) {
-        // This is a left element. If the right list is empty, no point in searching for a match.
-        if (rightStateList.isEmpty()) {
-          leftStateList.add(KV.of(timestamp, left));
-          leftState.write(leftStateList);
-          return;
-        }
-
         // Search the right collection for a match.
         int i = 0;
+        ArrayList<Integer> toRemove = new ArrayList<>();
         boolean found = false;
         for (KV<Instant, V2> kv : rightStateList) {
           if (new Duration(kv.getKey(), timestamp).abs().isShorterThan(temporalBound)
               && compareFn.apply(KV.of(left, kv.getValue()))) {
+            toRemove.add(i);
             found = true;
             c.output(KV.of(key, KV.of(left, kv.getValue())));
             break;
+          } else if (kv.getKey().isBefore(temporalBoundWatermark)) {
+            toRemove.add(i);
           }
           ++i;
         }
-        if (found) {
-          rightStateList.remove(i);
+        if (!toRemove.isEmpty()) {
+          for (int j : toRemove) {
+            rightStateList.remove(j);
+          }
           rightState.write(rightStateList);
+        }
+        if (!found) {
+          leftStateList.add(KV.of(timestamp, left));
+          leftState.write(leftStateList);
+          return;
         }
       } else {
         checkNotNull(right);
-
-        if (leftStateList.isEmpty()) {
-          rightStateList.add(KV.of(timestamp, right));
-          rightState.write(rightStateList);
-          return;
-        }
-
         int i = 0;
+        ArrayList<Integer> toRemove = new ArrayList<>();
         boolean found = false;
         for (KV<Instant, V1> kv : leftStateList) {
           if (new Duration(kv.getKey(), timestamp).abs().isShorterThan(temporalBound)
               && compareFn.apply(KV.of(kv.getValue(), right))) {
+            toRemove.add(i);
             found = true;
             c.output(KV.of(key, KV.of(kv.getValue(), right)));
             break;
+          } else if (kv.getKey().isBefore(temporalBoundWatermark)) {
+            toRemove.add(i);
           }
           ++i;
         }
-        if (found) {
-          leftStateList.remove(i);
+        if (!toRemove.isEmpty()) {
+          for (int j : toRemove) {
+            leftStateList.remove(j);
+          }
           leftState.write(leftStateList);
         }
+        if (!found) {
+          rightStateList.add(KV.of(timestamp, right));
+          rightState.write(rightStateList);
+          return;
+        }
       }
+    }
+
+    private void setTimer(
+        @TimerId("eviction") Timer evictionTimer) {
+      // TODO: What's the idiomatic way set a callback for when the watermark advances N relative
+      // seconds?
+      switch(evictionTimerState) {
+        case UNINITIALIZED:
+          evictionTimerState = TimerState.SET;
+          evictionTimer.set(new Instant(0L));
+          break;
+        case UNSET:
+          evictionTimerState = TimerState.SET;
+          evictionTimer.set(temporalBoundWatermark.plus(evictionFrequency));
+          break;
+        case SET: // do nothing
+          break;
+      }
+    }
+
+    @OnTimer("eviction")
+    public void onEviction(OnTimerContext c) {
+      temporalBoundWatermark = c.timestamp().minus(temporalBound);
+      evictionTimerState = TimerState.UNSET;
+      throw new IllegalStateException("POW: " + temporalBoundWatermark);
     }
   }
 
